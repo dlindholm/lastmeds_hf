@@ -1,0 +1,730 @@
+---
+title: "Heart failure treatment in the last years of life"
+author: "Daniel Lindholm"
+output:
+  html_document:
+    number_sections: TRUE
+    toc: TRUE
+    toc_float: TRUE
+---
+```{r, include = FALSE}
+# Setup ========================================================================
+  # Default chunk options
+    knitr::opts_chunk$set(
+      echo = FALSE,
+      message = FALSE,
+      warning = FALSE,
+      dev = "svg",
+      fig.topcaption = TRUE,
+      fig.align = "center")
+
+  options(scipen=999)
+
+  # Load packages
+  pkgs <- c("data.table", "Epi", "fst", "ggplot2", "gt", "gtsummary",
+                "labelled", "mgcv", "parallel", "popEpi", "stringr")
+  vapply(pkgs, library, logical(1), character.only = TRUE, logical.return = TRUE,
+       quietly = TRUE)
+
+  # Settings for parallel processing
+  setDTthreads(0L) # Use all threads with data.table
+  cores <- detectCores()-1L
+
+  # Set color scheme
+  col_blrd <- c("#0072B5FF", "#BC3C29FF") 
+  cols     <- c("#E18727FF", "#20854EFF", 
+                "#7876B1FF", "#6F99ADFF",
+                "#EE4C97FF", "#FFDC91FF")
+
+```
+
+```{r}
+# Load data ====================================================================
+  # Lists of ATC-codes, ICD codes for defining comorbidities,
+  # and variable labels  
+  atc        <- readRDS("/lastmeds/data/atc.rds")
+  comorb_icd <- readRDS("/lastmeds/data/comorb_icd.rds")
+  vars       <- readRDS("/lastmeds/data/vars.rds")
+
+  # Main dataset (d) and comorbidities (comorb)
+  d          <- read_fst("/lastmeds/data/meds.fst",   as.data.table = TRUE)
+  comorb     <- read_fst("/lastmeds/data/comorb.fst", as.data.table = TRUE) 
+
+  # Causes of death
+  cod        <- read_fst("/lastmeds/data/death_icd.fst", as.data.table = TRUE) 
+
+  # ICD10
+  icd        <- fread("/lastmeds/data/icd10_2010.txt")
+
+  # Apply labels (inefficient, since this function copies the dataset, but still)
+  var_label(d)      <- vars[names(vars) %in% names(d)]
+  var_label(comorb) <- vars[names(vars) %in% names(comorb)]
+```
+# Background
+The purpose of these analyses is to investigate medication treatment patterns in
+the last years before death in patients with heart failure. By looking back in 
+time from the date of death, employing a Lexis-based method, to avoid 
+conditioning on the future.
+
+## Data sources
+The analysis is based on Swedish nationwide registers relating to healthcare, 
+from the _Swedish National Board of Health and Welfare (Socialstyrelsen)_:
+
+- National patient register
+- National cause of death register
+- National prescribed drug register
+
+## Study population
+The study population is definied by:
+
+1. **Heart failure diagnosis** at any time before death, defined as an ICD10 
+code starting with **I50**, in either in-patient or specialized out-patient 
+care, in any diagnosis position.
+2. **Death**, with a death date on or after 2007-07-01, and an age at death of 
+18 or greater.
+
+Using _only_ I50 is based on previous research where a high diagnostic validity 
+was found in the Swedish setting, when using I50 in the primary or any of the 
+secondary diagnosis positions
+([Schaufelberger et al 2020](https://pubmed.ncbi.nlm.nih.gov/31869528/)).
+
+The cut-off regarding death dates was selected in order to have sufficient look 
+back time (2 years or more), as the _Prescribed drugs register_ started in July 
+of 2005.
+
+## Medications
+Medications under study are identified in the _Prescribed drugs register_ using 
+ATC codes:
+
+```{r}
+# [TBL]: Meds definitions ======================================================  
+  data.table(`Treatment class` = names(atc),
+             ATC = sapply(atc, paste, collapse = "|")) |>
+      gt() |>
+        tab_header(title = "ATC codes for heart failure medications",
+          subtitle = md("^ indicates _begins with_, | indicates _OR_"))
+```
+
+## Comorbidites
+Relevant comorbidities are extracted from both _Causes of death_ and 
+_National Patient registers_, using the following ICD10 codes in any position:
+
+```{r}
+# [TBL]: Comorbidities definitions =============================================
+  data.table(Comorbidity = names(comorb_icd),
+             ICD10 = sapply(comorb_icd, paste, collapse = "|"))[order(Comorbidity)] |>
+      gt() |>
+        tab_header(title = "ICD10 codes for defining comorbidities",
+          subtitle = md("^ indicates _begins with_, | indicates _OR_"))
+```
+
+## Missing data
+Exact death dates were missing in a very small proportion of patients (<1%).
+In case of such occurrences, the following principles were employed:
+
+- If only year is known, the date will imputed to the 1st of July of that year 
+(approximately the mid point of the year)
+- If only year and month is known, the date will be imputed to the 15th day of 
+that month (approximately the mid point of a month).
+
+No other imputation was performed, because missingness was very low and
+considered to be negligble.
+
+
+```{r}
+# Derive variables =============================================================
+  # [dth_yr]: year of death (rather than date) ------------------------
+  d[, dth_yr := floor(dodth)]
+  comorb[, dth_yr := floor(dodth)]
+
+  # [txclass5]: collapse ACE, ARB, ARNI => 5 medication categories ----
+  d[, txclass5 := ifelse(txclass %in% c("ace", "arb", "arni"),
+                         "ACE/ARB/ARNI", txclass)]
+
+  # [age_dx]: age at HF diagnosis -------------------------------------
+  comorb[, age_dx := dohf - dob]
+  var_label(comorb$age_dx) <- "Age at heart failure diagnosis"
+
+  # [age_dth]: age at death -------------------------------------------
+  comorb[, age_dth := dodth - dob]
+  var_label(comorb$age_dth) <- "Age at death"
+  d[, age_dth := dodth - dob]
+
+  # [years_dx_dth]: years from hf diagnosis to death ------------------
+  comorb[, years_dx_dth := dodth - dohf]
+
+  # [doex]: date of exit ----------------------------------------------
+  # This is the end date of the follow back time, where, in case no
+  # treatment discontinuation occurred, patients will be censored.
+  # Takes the maximum of these:
+  #   1. date of HF diagnosis (dohf)
+  #   2. 1 July 2005 (apx prescribed drugs registry start date)
+  d[, doex := ifelse(dohf > cal.yr("2005-07-01"), dohf, cal.yr("2005-07-01"))]
+
+# Select population ============================================================
+  # Dataset already contains only patients who had a HF diagnosis at some point
+  # before death (in any diagnosis position). 
+  #
+  # Prescribed medications register started in July 2005, so in order to have 
+  # proper look back time (2 years or more), we will restrict the study
+  # population to patients who died on 1 July 2007 or later
+  #
+  # Also, select patients in whom age at death equals to or exceeds 18
+
+  d      <-      d[dodth >= cal.yr("2007-07-01") & 
+                   dodth <= cal.yr("2020-12-31") &
+                   age_dth >= 18 & dohf < dodth]
+  comorb <- comorb[dodth >= cal.yr("2007-07-01") & 
+                   dodth <= cal.yr("2020-12-31") &
+                   age_dth >= 18 & dohf < dodth]
+
+  # [FUNCTION]: cyd (cal.yr to date conversion) ----
+  cyd <- function(x) structure(round((x - 1970) * 365.25), class = "Date")
+```
+
+# Population characteristics
+There were `r nrow(comorb)` patients who met the criteria above, i.e. died with 
+heart failure between `r cyd(min(comorb$dodth))` and `r cyd(max(comorb$dodth))`,
+with a total follow-up time of `r round(d[, .SD[1L] , by = id_pat][, sum(dodth-doex)])`
+person-years.
+
+## By calendar year of death
+
+```{r}
+# [TBL]: Population characteristics (by death year) ----------------------------
+  # Arrange by frequency
+  tmp <- t(comorb[, 6:21][, lapply(.SD, sum)])
+  tmp <- data.table(variable = rownames(tmp),
+                    n = as.numeric(tmp),
+                    var_number = 6:21)
+  setorder(tmp, -n)
+  # Create table
+  comorb[, .SD, .SDcols = c(2, 22:24, tmp$var_number)] |>
+    tbl_summary(by = "dth_yr") |>
+      add_overall() |> 
+        as_gt() |>
+          tab_options(table.font.size = "65%")  
+```
+
+## By sex
+
+```{r}
+# [TBL]: Population characteristics (by sex) -----------------------------------
+  comorb[, .SD, .SDcols = c(2, 22:24, tmp$var_number)] |>
+    tbl_summary(by = "sex") |>
+      add_overall() 
+```
+
+## Main observations
+
+- For several of the comorbidities, there was an _increasing_ proportion over time:
+  - Hypertension
+  - AFib
+  - Cancer
+  - CKD
+  - Valvular heart disease
+  - Thyroid disease
+  - Cardiomyopathies
+  - PAH
+- For __ischemic heart disease__, there was a _decreasing_ proportion over time.
+- The age at diagnosis and age at death remained stable
+
+# Causes of death
+
+```{r}
+  cod <- cod[id_pat %in% comorb$id_pat]
+
+  # Limit to third position of ICD code
+  cod[, code := substr(code, 1, 3)]
+
+  # Left join with ICD10
+  tmp <- merge(cod, icd, by = "code", all.x = TRUE)
+  tmp <- tmp[, .(id_pat, code, code_text)]
+
+  # Manually add COVID-19 text for code U07 (ICD file is from 2010)
+  tmp[code == "U07", code_text := "COVID-19"]
+
+  # For 2021, COD had not been entered yet -> remove
+  tmp <- tmp[!is.na(code)]
+
+  # Combine text and ICD code
+  tmp[, cod := paste0(code_text, " (", code, ")") ]
+
+  # Count deaths
+  tmp <- tmp[, .(.N), by = "cod"]
+  setorder(tmp, -N)
+  
+  # Create table
+  tmp[1:20, .(`Cause of death (ICD10 code)` = cod)] |>
+    gt() |>
+      tab_header(title = "Twenty most common causes of death")
+
+  rm(tmp)
+```
+
+
+# Prevalent treatment at the time of death
+The proportion of patients on each medication at the time of death by calendar
+year of death was estimated using a binomial model, entering year of death as
+a penalized spline:
+```{r}
+  # [FUNCTION]: get_tx_at_death ----------------------------------------------
+  # Calculates the proportion of patients on each medication at the time
+  # of death, for the individuals specified in 'ids'. Default is full
+  # population.        
+
+    get_tx_at_death <- function(ids = unique(d$id_pat))
+      {
+        # Summarize number of deaths by year
+        deaths_per_year <- d[id_pat %in% ids,
+                             .SD[1L], by = .(id_pat, dth_yr)][
+                                  , .N, by = .(dth_yr)][
+                                      order(dth_yr)]
+
+        # Summarize number of patients treated at time of death per class and year
+        tx_per_year <- d[!is.na(txclass5) & dotxend >= dodth & id_pat %in% ids,
+                         .SD[1L], by = .(id_pat, txclass5)][
+                            , .(X = .N), by = .(dth_yr, txclass5)][
+                                order(dth_yr)]
+        
+        # Join to one table
+        tx_per_year[deaths_per_year, on = c("dth_yr"), N := i.N]
+
+        tx_per_year
+      }
+
+  # [FUNCTION]: model_tx_at_death --------------------------------------------
+  # Models treatment at the time of death in a binomial model entering year
+  # of death as a penalized spline.     
+    model_tx_at_death <- function(treatment, dataset = tx_at_death, k_val = 6){   
+      gam(cbind(X, N-X) ~ s(dth_yr, k = k_val),
+          family = binomial,
+          data = dataset[txclass5 == treatment])
+      }
+
+  # [FUNCTION]: predict_tx_at_death ------------------------------------------
+  # Makes predictions from the binomial models    
+    predict_tx_at_death <- function(model, treatment, dataset = tx_at_death)
+      {
+          minyear <- min(dataset[txclass5 == treatment]$dth_yr)
+          maxyear <- max(dataset[txclass5 == treatment]$dth_yr)
+          nd <- data.frame(dth_yr = seq(minyear, maxyear, 0.2))
+          pred <- as.data.table(ci.pred(model, nd) * 100)
+          names(pred) <- c("est", "lci", "uci")
+          pred <- cbind(pred, dth_yr = nd$dth_yr)
+          pred[, txclass5 := treatment]
+          pred
+      }
+```
+```{r, fig.width = 5, fig.height = 4.5}
+# [FIG]: Prevalent treatment at death by year of death -----------
+  tx_at_death   <- get_tx_at_death()
+  tx            <- c("ACE/ARB/ARNI", "bb", "loop", "mra", "sglt2")
+  dth_models    <- lapply(tx, model_tx_at_death)
+  names(dth_models) <- tx
+  dth_preds     <- Map(predict_tx_at_death,
+                         model = dth_models,
+                         treatment = names(dth_models))
+  dth_plotdata  <- rbindlist(dth_preds)
+  dth_plotdata[, txclass5_fct := factor(txclass5, levels = tx,
+                                  labels = c("ACEi/ARB/ARNi",
+                                             "Beta blocker",
+                                             "Loop diuretic", 
+                                             "MRA",
+                                             "SGLT2i"))]
+  ggplot(dth_plotdata, aes(x = dth_yr, y = est,
+                          color = txclass5_fct, fill = txclass5_fct))+
+    geom_ribbon(show.legend = FALSE, 
+                mapping = aes(ymin = lci, ymax = uci),
+                alpha = 0.5,
+                lty = 0)+
+    geom_line()+
+    scale_color_manual(values = cols[1:5])+
+    scale_fill_manual(values = cols[1:5])+
+    labs(y = "Proportion on medication (%)",
+         x = "Year of death",
+         color = "") +
+    scale_y_continuous(expand=c(0,0), breaks = seq(0, 80, 20), limits = c(0,80))+
+    scale_x_continuous(expand=c(0,0), breaks = seq(2008, 2020, 2))+
+    theme_bw()+
+    theme(legend.position = "top",
+          legend.text = element_text(size = 6),
+          panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          aspect.ratio = 1)
+```
+
+Alternative formatting:
+
+```{r}
+dth_plotdata[, fct := "Proportion on treatment at time of death"]
+death_plot <-  ggplot(dth_plotdata, aes(x = dth_yr, y = est,
+                          color = txclass5_fct, fill = txclass5_fct))+
+    geom_ribbon(show.legend = FALSE, 
+                mapping = aes(ymin = lci, ymax = uci),
+                alpha = 0.5,
+                lty = 0)+
+    geom_line()+
+    scale_color_manual(values = cols[1:5])+
+    scale_fill_manual(values = cols[1:5])+
+    labs(y = "Proportion on medication (%)",
+         x = "Year of death",
+         color = "") +
+    scale_y_continuous(expand=c(0,0), breaks = seq(0, 80, 20), limits = c(0,80))+
+    scale_x_continuous(expand=c(0,0), breaks = seq(2008, 2020, 2))+
+    theme_bw()+
+    theme(legend.position = "right",
+          panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          aspect.ratio = 1)+
+    facet_wrap(~fct)
+pdf("/lastmeds/dp2.pdf", width = 6, height = 6)
+  death_plot
+dev.off()
+
+death_plot
+dth_plotdata[, fct := NULL]
+```
+
+## Main observations:
+
+- There was a substantial increase in the proportion of patients who were on
+beta blocker at the time of death
+- Similarly, there was a marked decrease in the proportion on a _standing 
+prescription_ of loop diuretics (NB: _as needed_ prescriptions are not included)
+- RAASi and MRAs were fairly stable over time
+- The proportion of patients on SGLT2i at time of death was increasing in the
+last few years of observation, at low numbers relative the other treatments.
+
+# Patients on treatment relative death by year of death
+The discontinuation rate was modeled using a Poisson model, and combined with
+the binomial model to estimate the proportion of patients on each treatment (y axis)
+by time before death (x axis) and by calendar year of death (panels).
+
+```{r, cache = TRUE, message = FALSE, warnings = FALSE, results = FALSE}
+# Treatment discontinuation --------------------------------------------------
+  # [FUNCTION]: prep_data ------------------------------------------
+    # Will select individuals who are not on the specified treatment
+    # at the time of death. Selects the last treatment discontinuation
+    # for those who had treatment before death (but not at death), and
+    # one row for each patient who did not have the treatment at all.
+    #
+    # Then, a Lexis object is created (Lexis), and follow-back time
+    # split by month (splitMulti).
+    #
+    # This split Lexis object will be returned.
+    prep_data <- function(treatment, yr){
+      tmp <- d[dth_yr == yr]
+
+      # Select population not on treatment at the date of death
+      treated_ids <- tmp[txclass5 == treatment & 
+                         dotxend  >= dodth &
+                         as_needed == FALSE,
+                         unique(id_pat)]
+      tmp <- tmp[!(id_pat %in% treated_ids)]
+
+      # Select population to keep latest discontinuation (in case of such); 1 row,
+      # or 1 row for each never on treatment
+      tmp[, treated := ifelse(txclass5 != treatment | is.na(txclass5), FALSE, TRUE)]
+      tmp[treated == FALSE, c("dotxstart", "dotxend") := NA]
+      tmp[, c("txclass", "atc", "as_needed", "txclass5") := NULL]
+      setorder(tmp, -dotxend, na.last = TRUE)
+      tmp <- tmp[, .SD[1L], by = id_pat]
+      
+      # If treatment occured only before censoring date (e.g. before diagnosis
+      # was made), set treated to FALSE
+      tmp[doex > dotxend, treated := FALSE]
+      
+      # If failure (i.e. treatment discontinuation) occured (treated = TRUE)
+      # update date of exit (doe) to take the value of last discontinuation
+      # (dotxend)
+      tmp[treated == TRUE, doe := dotxend]
+
+      # Create a Lexis object
+      lex <- Lexis(data        = tmp,
+                   entry       = list(per = -dodth, fbt = 0),
+                   exit        = list(per = -doex),
+                   exit.status = factor(treated,
+                                        labels = c("no tx", "tx")))
+
+      # Split follow-back time into months
+      splitlex <- splitMulti(lex, fbt = seq(0, max(lex$lex.dur), 1/12))
+      splitlex
+     }
+
+  # [FUNCTION]: model_disc -----------------------------------------
+    model_disc <- function(splitlex, k_val = 6){
+    # Fit a Poisson model to model rate of discontinuation by follow-back time
+    # modeled as a penalized spline
+      bam(cbind(lex.Xst == "tx", lex.dur) ~ s(fbt, k = k_val),
+          family   = poisreg,
+          data     = splitlex,
+          nthreads = cores,
+          discrete = TRUE)
+      }
+
+  # [FUNCTION]: predict_disc ---------------------------------------
+    # Make predictions
+    predict_disc <- function(model, max_years){
+      nd <- data.table(fbt = seq(1/12, max_years, 1/12))
+      pred <- as.data.table(ci.cum(model, nd) * 100)
+      names(pred) <- c("est", "lci", "uci", "se")
+      pred <- cbind(pred, fbt = nd$fbt)
+    }
+
+  # [FUNCTION]: combine_models -------------------------------------
+    # Combines estimates of prevalent treatment at time of death (the binomial
+    # model) with the Poisson estimates of time from death to last
+    # discontinuation, to estimate the proportion of patients on treatment by
+    # time before death.
+    combine_models <- function(treatment, yr, followback){
+      # Predict discontinuation
+      disc_prediction <- prep_data(treatment, yr) |>
+        model_disc() |>
+          predict_disc(followback)
+      disc_prediction[, se := NULL]
+
+      # Get baseline data from the binomial model predictions
+      baseline <- dth_plotdata[txclass5 == treatment & dth_yr == yr]
+      on_at_dth <- baseline[, est]
+      
+      # Scale to consider the proportion of total population
+      columns <- c("est", "lci", "uci")
+      disc_prediction[, (columns) := lapply(.SD,
+        function(x) x * (1 - on_at_dth / 100)),
+        .SDcols = columns]
+
+      # Combine with the binomial model estimate (i.e. offset curve by
+      # the proportion on medication at death)
+      disc_prediction[, (columns) := lapply(.SD,
+        function(x) x + on_at_dth),
+        .SDcols = columns]
+
+      results <- rbindlist(
+        list(data.table(est = on_at_dth, lci = on_at_dth, uci = on_at_dth, fbt = 0),
+             disc_prediction)
+        )
+      results[, `:=` (txclass5 = treatment, dth_yr = yr)]
+      results
+      }
+
+  # Make predictions for all classes except SGLT2i
+  preds <- lapply(tx[-5], function(x) {
+      Map(combine_models, treatment = x, yr = 2008:2020, followback = 5)})
+  
+  # Make predictions for SGLT2i (special case, since it was not available during
+  # the whole study period)
+  pred_sglt2 <- Map(combine_models, treatment = "sglt2",
+                    yr = 2015:2020, followback = 5)
+  pred_sglt2 <- rbindlist(pred_sglt2)
+  pred_sglt2 <- pred_sglt2[(dth_yr - fbt) > 2014]
+
+  # Combine and tidy up
+  disc_plotdata <- rbindlist(lapply(preds, rbindlist))
+  disc_plotdata <- disc_plotdata[(dth_yr - fbt) > 2007]
+  disc_plotdata <- rbind(disc_plotdata, pred_sglt2)
+  disc_plotdata[, txclass5_fct := factor(txclass5, levels = tx,
+                                      labels = c("ACEi/ARB/ARNi",
+                                                 "Beta blocker",
+                                                 "Loop diuretic", 
+                                                 "MRA",
+                                                 "SGLT2i"))]
+```
+
+```{r, fig.width = 9, fig.height = 9}
+# Create plot
+ggplot(disc_plotdata, aes(x = -fbt, y = est,
+                          color = txclass5_fct, fill = txclass5_fct))+
+  geom_ribbon(show.legend = FALSE, 
+              mapping     = aes(ymin = lci, ymax = uci),
+              alpha       = 0.5,
+              lty         = 0)+
+  geom_line()+
+  scale_color_manual(values = cols[1:5])+
+  scale_fill_manual(values  = cols[1:5])+
+  labs(y = "Proportion on medication (%)",
+       x = "Years relative death",
+       color = "")+
+  geom_vline(xintercept = 0, lty = 3, linewidth = 0.25)+
+  scale_y_continuous(expand=c(0,0), limits = c(0, 100), breaks = seq(0, 100, 20))+
+  theme_bw()+
+  theme(legend.position = "top",
+        panel.grid.major = element_line(size = 0.25),
+        panel.grid.minor = element_blank(),
+        aspect.ratio = 1) +
+  facet_wrap(~ dth_yr, ncol = 5)
+
+```
+
+Beta blocker seem to increase over time. Plot to zoom in on beta blockers, looking 
+at all years gathered into one plot. Darker line indicates more recent
+calendar year.
+
+```{r}
+disc_bb <- disc_plotdata[txclass5 == "bb"]
+
+ggplot(disc_bb, aes(x = -fbt, y = est, fill = factor(dth_yr),color = factor(dth_yr))) +
+  geom_ribbon(aes(ymin = lci, ymax = uci), alpha = 0.2, lty = 0)+
+  geom_line()+
+  geom_text(data = disc_bb[fbt == 0],
+            aes(x = 0.2, y = est, label = dth_yr),
+            color = "black",
+            size = 1.8)+
+  geom_vline(xintercept = 0, lty = 3, linewidth = 0.25)+
+  scale_fill_grey(start = 0.8, end = 0.2)+
+  scale_color_grey(start = 0.8, end = 0.2)+
+  scale_y_continuous(breaks = seq(50, 80, 5))+
+  labs(y = "Proportion on beta blocker (%)",
+       x = "Years relative death")+
+  theme_bw()+
+  theme(legend.position = "none",
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        aspect.ratio = 1)
+```
+
+Same kind of plot for all drug classes:
+
+```{r}
+# Define color scales
+col_orange  <- colorRampPalette(c("#FFE9D1", "#E18727"), space = "Lab")
+col_green   <- colorRampPalette(c("#C5E6D4", "#20854E"), space = "Lab")
+col_purple  <- colorRampPalette(c("#DFDEFF", "#7876B1"), space = "Lab")
+col_blue    <- colorRampPalette(c("#CFECFA", "#6F99AD"), space = "Lab")
+col_magenta <- colorRampPalette(c("#FFE3F0", "#EE4C97"), space = "Lab")
+disc_plotdata[, plot_colorcat := paste(txclass5, dth_yr)]
+shades <- c(col_orange(13), col_green(13), col_purple(13), col_blue(13),
+            col_magenta(6))
+
+
+disc_plot <- ggplot(disc_plotdata, aes(x = -fbt, y = est, group = factor(dth_yr),
+                          fill  = factor(plot_colorcat),
+                          color = factor(plot_colorcat))) +
+  geom_ribbon(aes(ymin = lci, ymax = uci), alpha = 0.2, lty = 0)+
+  geom_line()+
+  geom_vline(xintercept = 0, lty = 3, linewidth = 0.25)+
+  scale_fill_manual(values = shades)+
+  scale_color_manual(values = shades)+
+  scale_x_continuous(expand = expansion(mult = c(0,0.05)),
+    limits = c(-5, 0), breaks = -5:0, labels = -5:0)+
+  facet_wrap(~ txclass5_fct, scales = "free_y")+
+  labs(y = "Proportion on medication (%)",
+       x = "Years relative death")+
+  theme_bw()+
+  theme(legend.position = "none",
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        aspect.ratio = 1)
+pdf("/lastmeds/mp.pdf")
+  disc_plot
+dev.off()
+
+disc_plot
+```
+
+
+## Main observations
+
+- The discontinuation rate of _beta blockers_ decreased over time. For most
+calendar years of death (where full follow-back of 5 years was available), the 
+proportion of patients on beta blocker 5 years before death was estimated at 
+about 80%, but the downward slope gradually diminishes over time, with later
+years showing a higher proportion on beta blockers at the time of death, 
+despite having a similar "start value" 5 years before.
+at the time of death. 
+- The discontinuation rate of loop diuretics was stable over time, but the proportion
+with the medication prescribed (as a _standing prescription_) tended to decrease
+- MRA treatment did not change over time
+- RAAS inhibition demonstrated a higher discontinuation rate (steeper downward slope)
+than other prescribed drugs, with a similar pattern observed for all calendar years
+
+# Sensitivity analyses
+
+## Prevalent treatment at the time of death - patients with HF diagnosis >= 5 year before death 
+
+```{r}
+# [FIG]: Prevalent treatment at death by year of death -----------
+  tx_at_death   <- get_tx_at_death(comorb[years_dx_dth >= 5, id_pat])
+  tx            <- c("ACE/ARB/ARNI", "bb", "loop", "mra", "sglt2")
+  dth_models    <- lapply(tx, model_tx_at_death)
+  names(dth_models) <- tx
+  dth_preds     <- Map(predict_tx_at_death,
+                         model = dth_models,
+                         treatment = names(dth_models))
+  dth_plotdata  <- rbindlist(dth_preds)
+  dth_plotdata[, txclass5_fct := factor(txclass5, levels = tx,
+                                  labels = c("ACEi/ARB/ARNi",
+                                             "Beta blocker",
+                                             "Loop diuretic", 
+                                             "MRA",
+                                             "SGLT2i"))]
+  ggplot(dth_plotdata, aes(x = dth_yr, y = est,
+                          color = txclass5_fct, fill = txclass5_fct))+
+    geom_ribbon(show.legend = FALSE, 
+                mapping = aes(ymin = lci, ymax = uci),
+                alpha = 0.5,
+                lty = 0)+
+    geom_line()+
+    scale_color_manual(values = cols[1:5])+
+    scale_fill_manual(values = cols[1:5])+
+    labs(y = "Proportion on medication (%)",
+         x = "Year of death",
+         color = "") +
+    scale_y_continuous(expand=c(0,0), breaks = seq(0, 80, 20), limits = c(0,80))+
+    scale_x_continuous(expand=c(0,0), breaks = seq(2008, 2020, 2))+
+    theme_bw()+
+    theme(legend.position = "top",
+          legend.text = element_text(size = 6),
+          panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          aspect.ratio = 1)
+```
+
+## Prevalent treatment at the time of death - patients with ischemic heart disease 
+
+```{r}
+# [FIG]: Prevalent treatment at death by year of death -----------
+  tx_at_death   <- get_tx_at_death(comorb[ihd == TRUE, id_pat])
+  tx            <- c("ACE/ARB/ARNI", "bb", "loop", "mra", "sglt2")
+  dth_models    <- lapply(tx, model_tx_at_death)
+  names(dth_models) <- tx
+  dth_preds     <- Map(predict_tx_at_death,
+                         model = dth_models,
+                         treatment = names(dth_models))
+  dth_plotdata  <- rbindlist(dth_preds)
+  dth_plotdata[, txclass5_fct := factor(txclass5, levels = tx,
+                                  labels = c("ACEi/ARB/ARNi",
+                                             "Beta blocker",
+                                             "Loop diuretic", 
+                                             "MRA",
+                                             "SGLT2i"))]
+  ggplot(dth_plotdata, aes(x = dth_yr, y = est,
+                          color = txclass5_fct, fill = txclass5_fct))+
+    geom_ribbon(show.legend = FALSE, 
+                mapping = aes(ymin = lci, ymax = uci),
+                alpha = 0.5,
+                lty = 0)+
+    geom_line()+
+    scale_color_manual(values = cols[1:5])+
+    scale_fill_manual(values = cols[1:5])+
+    labs(y = "Proportion on medication (%)",
+         x = "Year of death",
+         color = "") +
+    scale_y_continuous(expand=c(0,0), breaks = seq(0, 80, 20), limits = c(0,80))+
+    scale_x_continuous(expand=c(0,0), breaks = seq(2008, 2020, 2))+
+    theme_bw()+
+    theme(legend.position = "top",
+          legend.text = element_text(size = 6),
+          panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          aspect.ratio = 1)
+```
+
+# Reproducibility
+All calculations were performed at Bianca, a part of the UPPMAX high-performance 
+computing infrastructure. To ensure reproducibility, the analysis environment was containerized,
+such that operating system, R version, and R package versions
+were locked; using _Apptainer_ (formerly known as Singularity). For details see session info below:
+```{r}
+sessionInfo()
+```

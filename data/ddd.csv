@@ -1,0 +1,66 @@
+atc;name;ddd;unit
+C09AA01;captopril;50;mg
+C09AA02;enalapril;10;mg
+C09AA03;lisinopril;10;mg
+C09AA04;perindopril;4;mg
+C09AA05;ramipril;2.5;mg
+C09AA06;quinapril;15;mg
+C09AA07;benazepril;7.5;mg
+C09AA08;cilazapril;2.5;mg
+C09AA09;fosinopril;15;mg
+C09AA10;trandolapril;2;mg
+C09AA11;spirapril;6;mg
+C09AA12;delapril;30;mg
+C09AA13;moexipril;15;mg
+C09AA14;temocapril;10;mg
+C09AA15;zofenopril;30;mg
+C09AA16;imidapril;10;mg
+C09CA01;losartan;50;mg
+C09CA02;eprosartan;0.6;g
+C09CA03;valsartan;80;mg
+C09CA04;irbesartan;0.15;g
+C09CA06;candesartan;8;mg
+C09CA07;telmisartan;40;mg
+C09CA08;olmesartan medoxomil;20;mg
+C09CA09;azilsartan medoxomil;40;mg
+C09CA10;fimasartan;60;mg
+A10BK01;dapagliflozin;10;mg
+A10BK02;canagliflozin;0.2;g
+A10BK03;empagliflozin;17.5;mg
+A10BK04;ertugliflozin;10;mg
+C07AA01;alprenolol;0.4;g
+C07AA02;oxprenolol;0.16;g
+C07AA03;pindolol;15;mg
+C07AA05;propranolol;0.16;g
+C07AA06;timolol;20;mg
+C07AA07;sotalol;0.16;g
+C07AA12;nadolol;0.16;g
+C07AA14;mepindolol;5;mg
+C07AA15;carteolol;10;mg
+C07AA16;tertatolol;5;mg
+C07AA23;penbutolol;40;mg
+C07AB01;practolol;0.3;g
+C07AB02;metoprolol;0.15;g
+C07AB03;atenolol;75;mg
+C07AB04;acebutolol;0.4;g
+C07AB05;betaxolol;20;mg
+C07AB06;bevantolol;0.3;g
+C07AB07;bisoprolol;10;mg
+C07AB08;celiprolol;0.2;g
+C07AB09;esmolol;2.5;g
+C07AB10;epanolol;0.2;g
+C07AB11;s-atenolol;50;mg
+C07AB12;nebivolol;5;mg
+C07AB13;talinolol;0.1;g
+C07AG01;labetalol;0.6;g
+C07AG02;carvedilol;37.5;mg
+C03DA01;spironolactone;75;mg
+C03DA02;potassium canrenoate;0.4;g
+C03DA04;eplerenone;50;mg
+C03CA01;furosemide;40;mg
+C03CA02;bumetanide;1;mg
+C03CA04;torasemide;15;mg
+C03CB01;furosemide and potassium;40;mg
+C03CB02;bumetanide and potassium;1;mg
+C03CC01;etacrynic acid;50;mg
+C03CD01;muzolimine;20;mg
