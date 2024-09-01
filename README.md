@@ -1,9 +1,11 @@
 # Heart failure treatment in the last years of life
 
+[Link to article](https://onlinelibrary.wiley.com/doi/10.1002/ejhf.3426)
+
 This repository contains code for the above project. 
 
 For reproducibility, the analysis environment was containerized using
-_Apptainer_ - thereby locking operating system (Ubuntu), R version (4.3.1) and
+_Apptainer_ - thereby locking operating system (Ubuntu), R version and
 R package versions.
 
 Running the code is of course only possible with access to the data, which is 
